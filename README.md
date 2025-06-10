@@ -1,4 +1,4 @@
-Table Full Use-Class Breakdown — Preferences, Standard Deviations, and Set Rent
+Table Full Use-Class Breakdown — Preferences, and Standard Deviations
 
 | Floor     | # | Utilisation                                                                 | Avg. Pref. | SD    |
 |-----------|---|------------------------------------------------------------------------------|------------|-------|
