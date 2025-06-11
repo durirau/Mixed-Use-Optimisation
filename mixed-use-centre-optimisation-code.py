@@ -1,207 +1,184 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Urban Redevelopment Optimization Model
-
-This script solves a mixed-integer nonlinear programming (MINLP) problem 
-to determine the optimal allocation of use-cases (e.g., retail, housing) 
-across different stories of a building. The objective is to find a balance 
-between maximizing rental income (investor's perspective) and fulfilling 
-the preferences of citizens (survey data).
-
-The model is formulated and solved using the PySCIPOpt library, an interface 
-for the SCIP Optimization Suite.
-
-A sensitivity analysis is performed by varying the weights of the two objective
-function components (rental income and citizen preferences).
-
-@author: anonymous for blind review
-@version: 1.1 (Variant A: rents weight = 1 - preference weight)
+@author: boerner, rau
 """
 
-# =============================================================================
-# 1. IMPORTS - Libraries required for the script
-# =============================================================================
-import pandas as pd  # Used for reading and handling data from Excel files.
-import numpy as np   # Used for numerical operations, especially array/matrix manipulation.
-from pyscipopt import Model, quicksum  # Core components from the SCIP solver interface.
+import sys
+import pandas as pd
+import numpy as np
+from pyscipopt import Model, quicksum
 
-# =============================================================================
-# 2. CONFIGURATION - All parameters and settings for the model
-# =============================================================================
+######################################
+# 1. ANALYSIS PARAMETERS
+######################################
 
-# --- File Paths ---
-INPUT_DATA_FILE             = 'preferences-and-rents.xlsx'
-DATA_SHEET                  = 'PreferencesRents'
-OUTPUT_SOLUTION_FILE        = 'Solution_Analysis.xlsx'
-MODEL_DEBUG_FILE_PREFIX     = 'model_Kaufhaus'
+# A list of weighting factors for the preference term to be tested in the sensitivity analysis.
+c_pref_list = [0.4, 0.5, 0.6]
 
-# --- Model Dimensions ---
-NUM_STORIES                 = 7       # Total number of stories in the building (indexed 0 to 6).
-NUM_USE_CASES               = 6       # Number of different use-cases per story (indexed 0 to 5).
+# The corresponding weights for the rent term are derived as (1 - c_pref).
+# round() is used to prevent minor floating-point inaccuracies.
+c_rent_list = [round(1 - p, 2) for p in c_pref_list]
 
-# --- Data Reading Parameters ---
-DATA_START_ROW              = 1       # Number of lines to skip before data (Excel row 2 header, data from row 3)
-PREFERENCES_COL_IDX         = 2       # Column C (0-based index = 2)
-RENTS_COL_IDX               = 6       # Column G (0-based index = 6)
 
-# --- Model Parameters ---
-STORY_IMPORTANCE_WEIGHTS    = [0.1467, 0.162, 0.138, 0.1226, 0.1158, 0.135, 0.1821]
-MAX_DISTINCT_USES_PER_STORY = NUM_STORIES * [4]
+######################################
+# 2. DATA IMPORT FROM EXCEL
+######################################
 
-# --- Sensitivity Analysis Parameters (Variant A) ---
-WEIGHT_PREFERENCES_LIST     = [0.3,  0.35, 0.4,  0.45, 0.5,  0.55, 0.6, 0.65, 0.7, 1.0]
-WEIGHT_RENTS_LIST           = [1 - w for w in WEIGHT_PREFERENCES_LIST]
+# Read the preferences and rents from the specified Excel file.
+# It is assumed that the data begins from the second row (header=1).
+df = pd.read_excel(
+    'preferences-and-rents.xlsx',
+    header=1,
+    usecols=['Average preferences', 'calculated rents']
+)
 
-# --- Solver Settings ---
-SOLVER_TIME_LIMIT_FULL      = 64800   # 18 hours
-SOLVER_TIME_LIMIT_SENSITIVITY = 1000  # ~16 minutes
+# Extract the columns as NumPy arrays for numerical processing.
+# The raw, original preference values.
+preferences_raw = df['Average preferences'].to_numpy()
+# The raw, original rent values are stored before normalisation.
+rents_raw = df['calculated rents'].to_numpy()
 
-# =============================================================================
-# 3. DATA LOADING AND PREPROCESSING
-# =============================================================================
-def load_and_preprocess_data(filename, sheet_name,
-                             start_row, rents_col, pref_col,
-                             m, n):
-    """
-    Lädt Präferenzen und Mieten aus dem Excel-Sheet und 
-    bereitet sie für das Modell auf.
+# The normalised rents are created for use in the optimisation model's objective function.
+rents_normalised = rents_raw / rents_raw.sum()
 
-    Args:
-        filename (str): Pfad zur Excel-Datei.
-        sheet_name (str): Name des Worksheets mit den Daten.
-        start_row (int): Anzahl der zu überspringenden Zeilen vor den Daten.
-        rents_col (int): Spaltenindex für die Mieten.
-        pref_col (int): Spaltenindex für die Präferenzen.
-        m (int): Anzahl der Stockwerke.
-        n (int): Anzahl der Use-Cases pro Stockwerk.
 
-    Returns:
-        tuple: (normierte Mieten, normierte Präferenzmatrix)
-    """
-    print("--- Loading and preprocessing data ---")
-    df_rents = pd.read_excel(
-        filename,
-        sheet_name=sheet_name,
-        skiprows=start_row,
-        usecols=[rents_col]
+# Model dimensions: m = number of storeys, n = number of departments.
+m, n = 7, 6
+# Verify that the number of preference entries matches the expected count for the model structure.
+expected_entries = (n - 1) + (m - 1) * n
+assert preferences_raw.size == expected_entries, \
+    f"Expected {expected_entries} preference entries, but found {preferences_raw.size}."
+
+
+######################################
+# 3. CONSTRUCT THE PREFERENCE MATRIX
+######################################
+
+# The 'preference_matrix_raw' holds the original, un-normalised preference values in a 7x6 structure.
+preference_matrix_raw = np.zeros((m, n))
+# The first storey (ground floor) has only 5 preference values, as one department cannot be located there.
+preference_matrix_raw[0, :n-1] = preferences_raw[0 : (n-1)]
+# All subsequent storeys have a preference value for each of the 6 departments.
+for i in range(1, m):
+    start = (n-1) + (i-1) * n
+    end   = (n-1) + i * n
+    preference_matrix_raw[i, :] = preferences_raw[start:end]
+
+# Matrix 'A' contains the row-normalised preference values for the model.
+# A[i,j] represents the relative preference for department j on storey i.
+A = (preference_matrix_raw.T / preference_matrix_raw.sum(axis=1)).T
+
+
+######################################
+# 4. FORMULATE AND RUN THE OPTIMISATION MODEL
+######################################
+# (This section contains the core optimisation logic)
+
+# Additional model parameters.
+w_mean = [0.1467, 0.162, 0.138, 0.1226, 0.1158, 0.135, 0.1821]  # Weights per storey.
+U      = [4] * m  # Maximum number of departments permitted per storey.
+
+# Initialise a dictionary to collect the solutions from all runs.
+all_solutions = {f"[{i},{j}]": [] for i in range(m) for j in range(n)}
+sensitivity_labels = list(zip(c_pref_list, c_rent_list))
+
+print("Starting optimisation runs for different weightings...")
+
+# Loop over all (c_pref, c_rent) pairs for the sensitivity analysis.
+for k, (c_pref, c_rent) in enumerate(sensitivity_labels):
+    print(f"  Run {k+1}/{len(sensitivity_labels)}: c_pref={c_pref}, c_rent={c_rent}")
+    
+    model = Model("DepartmentStore")
+
+    # === DECISION VARIABLES ===
+    # x[i,j]: proportion of department j allocated to storey i (continuous).
+    x = {(i,j): model.addVar(vtype='C', lb=0, ub=1, name=f"x_{i}-{j}")
+         for i in range(m) for j in range(n)}
+    # z[i,j]: 1 if department j is located on storey i, 0 otherwise (binary).
+    z = {(i,j): model.addVar(vtype='B', name=f"z_{i}-{j}")
+         for i in range(m) for j in range(n)}
+
+    # === GENERAL CONSTRAINTS ===
+    # Constraints applicable to each storey.
+    for i in range(m):
+        model.addCons(quicksum(z[i,j] for j in range(n)) <= U[i])  # Max U departments per storey.
+        model.addCons(quicksum(x[i,j] for j in range(n)) == 1)   # Each storey's area is fully utilised.
+        for j in range(n):
+            model.addCons(x[i,j] <= z[i,j])  # Links the continuous variable x to the binary variable z.
+
+    # === LOGICAL CONSTRAINTS ===
+    # Specific business rules for the department store layout.
+    model.addCons(z[0,5] == 0) # Forbids department 5 on storey 0.
+    model.addCons(z[0,4] + z[1,4] <= 1)
+    model.addCons(z[3,4] + z[5,3] <= 1)
+    model.addCons(z[3,5] + z[5,4] <= 1)
+    for i in (3,4,5):
+        apart_idx = 3 if i==3 else 2
+        others = [j for j in range(n) if j != apart_idx]
+        model.addCons(quicksum(z[i,j] for j in others) <= 5*(1 - z[i,apart_idx]))
+    model.addCons(z[3,3] + z[5,2] <= 1 + z[4,2])
+    model.addCons(z[3,0] <= quicksum(z[2,j] for j in range(n)))
+    model.addCons(z[6,4] <= quicksum(z[5,j] for j in (0,1,2)))
+
+    # === OBJECTIVE FUNCTION ===
+    # Formulated via an auxiliary variable for clarity.
+    obj_pref = model.addVar(vtype='C', name="obj_pref")
+    # A flattened list of variables, excluding the forbidden combination (0,5).
+    x_flat   = [x[i,j] for i in range(m) for j in range(n) if not (i==0 and j==5)]
+    
+    # The preference term: Minimises the weighted squared deviation from ideal preferences.
+    model.addCons(
+        quicksum(c_pref * w_mean[i] * quicksum((x[i,j] - A[i,j])**2 for j in range(n))
+                 for i in range(m))
+        == obj_pref
     )
-    rents = df_rents.values.astype(float)
-    normalized_rents = rents / rents.sum()
-    df_prefs = pd.read_excel(
-        filename,
-        sheet_name=sheet_name,
-        skiprows=start_row,
-        usecols=[pref_col]
-    )
-    prefs = df_prefs.values.astype(float)
-    raw_A = np.zeros((m, n))
-    raw_A[0, :n-1] = prefs[:n-1, 0]
-    for i in range(1, m):
-        start = (n-1) + (i-1)*n
-        raw_A[i] = prefs[start:start+n, 0]
-    A = np.array([row/row.sum() if row.sum()>0 else row for row in raw_A])
-    print("--- Data processing complete ---\n")
-    return normalized_rents.flatten(), A
+    
+    # The rent term is maximised (or, its negative is minimised).
+    # The final objective balances preference satisfaction against rent maximisation.
+    model.setObjective(quicksum([-c_rent * np.dot(rents_normalised, x_flat)]) + obj_pref,
+                       "minimize")
 
-# =============================================================================
-# 4. OPTIMIZATION MODEL DEFINITION AND SOLVING
-# =============================================================================
-def build_and_solve_model(params):
-    model = Model("UrbanRedevelopmentModel")
-    x, z = {}, {}
-    for i in range(params['m']):
-        for j in range(params['n']):
-            x[i, j] = model.addVar(vtype='C', name=f"x_{i}-{j}", lb=0, ub=1)
-            z[i, j] = model.addVar(vtype='B', name=f"z_{i}-{j}")
-    for i in range(params['m']):
-        model.addCons(quicksum(x[i, j] for j in range(params['n'])) == 1, name=f"Use100PercentAreaInStory_{i}")
-        model.addCons(quicksum(z[i, j] for j in range(params['n'])) <= params['U'][i], name=f"AtMost_{params['U'][i]}_UsesInStory_{i}")
-        for j in range(params['n']): model.addCons(x[i, j] <= z[i, j], name=f"Implication_{i}_{j}")
-    model.addCons(z[0, 5] == 0, name="Eliminate_Use_5_in_Story_0")
-    model.addCons(z[0, 4] + z[1, 4] <= 1, name="Exclusive_Local_Supply_Location")
-    model.addCons(z[3, 4] + z[5, 3] <= 1, name="Exclusive_Sport-Culture_Location")
-    model.addCons(z[3, 5] + z[5, 4] <= 1, name="Exclusive_Restaurant_Location")
-    num_other_uses = params['n'] - 1
-    model.addCons(z[3, 0] + z[3, 1] + z[3, 2] + z[3, 4] + z[3, 5] <= num_other_uses * (1 - z[3, 3]), name="Exclusive_Apartments_GS3")
-    model.addCons(z[4, 0] + z[4, 1] + z[4, 3] + z[4, 4] + z[4, 5] <= num_other_uses * (1 - z[4, 2]), name="Exclusive_Apartments_GS4")
-    model.addCons(z[5, 0] + z[5, 1] + z[5, 3] + z[5, 4] + z[5, 5] <= num_other_uses * (1 - z[5, 2]), name="Exclusive_Apartments_GS5")
-    model.addCons(z[3, 3] + z[5, 2] <= 1 + z[4, 2], name="Continuity_of_Living")
-    model.addCons(z[3, 0] <= z[2, 0] + z[2, 1] + z[2, 2] + z[2, 3], name="Local_Supply_Dependency_GS3_on_GS2")
-    model.addCons(z[6, 4] <= z[5, 0] + z[5, 1] + z[5, 2], name="Exclusive_Use_Dependency_GS6_on_GS5")
-    obj_pref_term = model.addVar(vtype='C', name="obj_preference_term")
-    x_vector = [x[i, j] for i in range(params['m']) for j in range(params['n']) if not (i == 0 and j == 5)]
-    model.addCons(quicksum(params['w_story'][i] * quicksum((x[i, j] - params['A'][i][j])**2 for j in range(params['n'])) for i in range(params['m'])) == obj_pref_term, name="Define_Preference_Objective")
-    model.setObjective(params['c_pref'] * obj_pref_term - params['c_rent'] * quicksum(params['M_flat'][k] * x_vector[k] for k in range(len(x_vector))), "minimize")
-    model.setParam('limits/time', params['time_limit'])
+    # === SOLVE AND COLLECT RESULTS ===
+    model.setParam('limits/time', 1000)
+    model.presolve()
     model.optimize()
-    if model.getStatus() in ["optimal", "timelimit", "userinterrupt"] and model.getNSols() > 0:
-        solution = {}
-        best_sol = model.getBestSol()
-        for i in range(params['m']):
-            for j in range(params['n']): solution[i, j] = model.getSolVal(best_sol, x[i, j])
-        return solution
-    return None
 
-# =============================================================================
-# 5. RESULTS EXPORT
-# =============================================================================
-def format_and_save_results(solutions_dict, sensitivity_labels,
-                             valid_combos, floors, usecases,
-                             filename):
-    print(f"\n--- Formatting results and saving to {filename} ---")
-    df = pd.DataFrame(solutions_dict, index=range(len(sensitivity_labels))).T
-    multi_cols = pd.MultiIndex.from_tuples(sensitivity_labels, names=["weight_preference","weight_rent"])
-    df.columns = multi_cols
-    labels = [f"{floors[idx]}: {usecases[idx]}" for idx in range(len(valid_combos))]
-    df.index = labels
-    df.to_excel(filename)
-    print("--- Results saved successfully ---")
+    status = model.getStatus()
+    for i in range(m):
+        for j in range(n):
+            val = (model.getSolVal(model.getBestSol(), x[i,j])
+                   if status!='infeasible' else np.nan)
+            all_solutions[f"[{i},{j}]"].append(val)
 
-# =============================================================================
-# 6. MAIN EXECUTION BLOCK
-# =============================================================================
-if __name__ == "__main__":
-    rents_flat, preferences_matrix = load_and_preprocess_data(
-        filename=INPUT_DATA_FILE,
-        sheet_name=DATA_SHEET,
-        start_row=DATA_START_ROW,
-        rents_col=RENTS_COL_IDX,
-        pref_col=PREFERENCES_COL_IDX,
-        m=NUM_STORIES,
-        n=NUM_USE_CASES
-    )
-    df_meta = pd.read_excel(
-        INPUT_DATA_FILE,
-        sheet_name=DATA_SHEET,
-        skiprows=DATA_START_ROW,
-        usecols=[0, 1],
-        header=None,
-        names=["Floor","Useclass"]
-    )
-    floors   = df_meta["Floor"].astype(str).tolist()
-    usecases = df_meta["Useclass"].tolist()
-    valid_combos = [(i, j) for i in range(NUM_STORIES) for j in range(NUM_USE_CASES) if not (i == 0 and j == NUM_USE_CASES-1)]
-    all_run_solutions = { f"[{i},{j}]": [] for (i,j) in valid_combos }
-    sensitivity_run_labels = list(zip(WEIGHT_PREFERENCES_LIST, WEIGHT_RENTS_LIST))
-    time_limit = SOLVER_TIME_LIMIT_SENSITIVITY if len(sensitivity_run_labels) > 1 else SOLVER_TIME_LIMIT_FULL
-    for k, (c_pref, c_rent) in enumerate(sensitivity_run_labels):
-        sol = build_and_solve_model({
-            'm': NUM_STORIES, 'n': NUM_USE_CASES,
-            'A': preferences_matrix, 'M_flat': rents_flat,
-            'w_story': STORY_IMPORTANCE_WEIGHTS, 'U': MAX_DISTINCT_USES_PER_STORY,
-            'c_pref': c_pref, 'c_rent': c_rent,
-            'time_limit': time_limit,
-            'debug_prefix': MODEL_DEBUG_FILE_PREFIX, 'run_k': k
-        })
-        for (i,j) in valid_combos:
-            label = f"[{i},{j}]"
-            all_run_solutions[label].append(sol.get((i,j), np.nan) if sol else np.nan)
-    format_and_save_results(
-        solutions_dict     = all_run_solutions,
-        sensitivity_labels = sensitivity_run_labels,
-        valid_combos       = valid_combos,
-        floors             = floors,
-        usecases           = usecases,
-        filename           = OUTPUT_SOLUTION_FILE
-    )
+
+######################################
+# 5. AGGREGATE AND EXPORT RESULTS
+######################################
+
+print("\nAggregating results into a single table...")
+
+# 1. Create the base results DataFrame.
+index_order = [f"[{i},{j}]" for i in range(m) for j in range(n)]
+df_results = pd.DataFrame(all_solutions, index=range(len(sensitivity_labels))).T
+df_results.columns = pd.MultiIndex.from_tuples(sensitivity_labels, names=["c_pref", "c_rent"])
+df_results = df_results.loc[index_order]
+df_results.index.name = "Variable (i,j)"
+
+# 2. Create columns for the original, un-normalised input data.
+# A list of original preference values, ordered to match the DataFrame index.
+preference_values_raw = [preference_matrix_raw[i, j] for i in range(m) for j in range(n)]
+
+# A list of original rent values. A value of 0 is used for the forbidden (0,5) combination.
+rent_map_raw = {(i, j): rent for (i, j), rent in zip([(i, k) for i in range(m) for k in range(n) if not (i == 0 and k == 5)], rents_raw)}
+rent_values_raw = [rent_map_raw.get((i, j), 0) for i in range(m) for j in range(n)]
+
+# 3. Insert the new columns containing the original data at the beginning of the results table.
+df_results.insert(0, 'Rent (Original)', rent_values_raw)
+df_results.insert(0, 'Preference (Original)', preference_values_raw)
+
+# 4. Export the final, combined table to a single Excel file.
+output_filename = "DepartmentStore_Results_Compact.xlsx"
+df_results.to_excel(output_filename)
+
+print(f"\nExport complete. The compact results table has been saved to '{output_filename}'.")
